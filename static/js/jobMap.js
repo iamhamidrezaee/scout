@@ -45,17 +45,7 @@ class MultiClusterMap {
     // ---------------------------------------
 
     setupReinforcementListeners() {
-        document.addEventListener('keydown', (event) => {
-            if (event.key.toLowerCase() === 'shift' && !this.reinforcementMode) {
-                this.enterReinforcementMode();
-            }
-        });
 
-        document.addEventListener('keyup', (event) => {
-            if (event.key.toLowerCase() === 'shift' && this.reinforcementMode) {
-                this.exitReinforcementMode();
-            }
-        });
     }
 
     enterReinforcementMode() {
@@ -296,9 +286,6 @@ class MultiClusterMap {
 
         // append the hint _inside_ the keyword bar
         d3.select(kwBar)
-            .append('div')
-            .attr('class', 'reinforce-hint')
-            .html('Press&nbsp;<b>Shift</b>&nbsp;to activate reinforcement');
     }
 
     //--------------------------------------
@@ -510,11 +497,7 @@ class MultiClusterMap {
             ...r, __clusterId: cid, id: i + 1
         }));
         const nodes = [centerNode, ...relatedNodes];
-        const links = relatedNodes.map(n => ({
-            source: 0,    // center is node id=0
-            target: n.id, // the related node
-            value: n.score
-        }));
+        const links = []
 
         // Create a group for this entire cluster
         const clusterGroup = this.zoomGroup.append("g")
