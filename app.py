@@ -3,7 +3,6 @@
 app.py - Scout Career Discovery Platform API
 Interactive job exploration with clustering and similarity analysis
 """
-
 import gzip
 import hashlib
 import json
@@ -12,7 +11,6 @@ import random
 import time
 import lzma
 from pathlib import Path
-
 import numpy as np
 from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
@@ -91,7 +89,7 @@ def modified_sigmoid(x):
 if need_recompute:
     print("[build] Computing TF-IDF / SVD for jobs...")
     texts = [f"{d.get('title','')} {d.get('description','')} {' '.join(d.get('skills', []))}" for d in data]
-
+    
     # TF-IDF
     vectorizer = TfidfVectorizer(
         stop_words="english",
@@ -100,12 +98,12 @@ if need_recompute:
         ngram_range=(1, 2),
     )
     tfidf_matrix = vectorizer.fit_transform(texts).astype(SPARSE_DTYPE_ON_DISK)
-
+    
     # SVD
     svd = TruncatedSVD(n_components=SVD_COMPONENTS, random_state=42)
     doc_vectors = svd.fit_transform(tfidf_matrix.astype(np.float32))
     doc_vectors = normalize(doc_vectors, axis=1).astype(DENSE_DTYPE_ON_DISK)
-
+    
     # Nearest neighbors for similarity
     nn = NearestNeighbors(n_neighbors=16, metric="cosine", algorithm="brute")
     nn.fit(doc_vectors.astype(np.float32))
@@ -115,7 +113,11 @@ if need_recompute:
     for row_i, (row_idx, row_dist) in enumerate(zip(idx[:, 1:], dist[:, 1:])):
         sims = []
         for j, d_ in zip(row_idx, row_dist):
-            salary_range = f"${data[j].get('salary_min', 0):,} - ${data[j].get('salary_max', 0):,}"
+            # Fix: Handle None values properly
+            salary_min = data[j].get('salary_min', 0) or 0
+            salary_max = data[j].get('salary_max', 0) or 0
+            salary_range = f"${salary_min:,} - ${salary_max:,}"
+            
             sims.append({
                 "id": j,
                 "original_id": j,
@@ -126,13 +128,12 @@ if need_recompute:
                 "score": float(1 - d_),
             })
         job_similarities.append(sims[:15])
-
+    
     # Save computed data
     import pickle
     
     with gzip.open(vectorizer_path, "wb", compresslevel=9) as fh:
         pickle.dump(vectorizer, fh)
-
     sparse.save_npz(tfidf_matrix_path, tfidf_matrix)
     
     # Save SVD model
@@ -149,23 +150,23 @@ if need_recompute:
     
     with lzma.open(svd_path, 'wb', preset=9) as f:
         pickle.dump(svd_components, f)
-
+    
     np.savez_compressed(docvecs_path, doc_vectors)
-
+    
     with gzip.open(similarities_path, "wb", compresslevel=9) as fh:
         pickle.dump(job_similarities, fh)
-
+    
     data_hash_path.write_text(data_hash)
     print("[build] ✓  pre-compute finished & cached")
 else:
     print("[load] Using pre-computed data")
     import pickle
-
+    
     with gzip.open(vectorizer_path, "rb") as fh:
         vectorizer = pickle.load(fh)
-
+    
     tfidf_matrix = sparse.load_npz(tfidf_matrix_path).astype(np.float32)
-
+    
     # Load SVD model
     with lzma.open(svd_path, 'rb') as f:
         svd_components = pickle.load(f)
@@ -180,12 +181,12 @@ else:
     svd.explained_variance_ = svd_components['explained_variance_'].astype(np.float64)
     svd.explained_variance_ratio_ = svd_components['explained_variance_ratio_'].astype(np.float64)
     svd.n_features_in_ = svd_components['n_features_in_']
-
+    
     doc_vectors = np.load(docvecs_path)["arr_0"].astype(np.float32)
     
     with gzip.open(similarities_path, "rb") as fh:
         job_similarities = pickle.load(fh)
-
+    
     doc_vectors = normalize(doc_vectors, axis=1)
 
 document_vectors_normalized = doc_vectors
@@ -216,14 +217,14 @@ def search():
     query = request.args.get("query", "").strip()
     if not query:
         return jsonify([])
-
+    
     # Check for exact job title match
     exact = [job for job in data if job.get("title", "").lower() == query.lower()]
     if exact:
         job = exact[0].copy()
         job["score"] = 1.0
         return jsonify(convert_to_serializable([job]))
-
+    
     try:
         # Transform query into TF-IDF
         query_tfidf = vectorizer.transform([query])
@@ -239,52 +240,52 @@ def search():
                     if len(hits) >= 5:
                         break
             return jsonify(convert_to_serializable(hits))
-
+        
         # Get TF-IDF cosine scores
         tfidf_scores = cosine_similarity(query_tfidf, tfidf_matrix).flatten()
-
+        
         # Narrow down to top K by TF-IDF
         K = 50
         top_idxs = np.argsort(tfidf_scores)[::-1][:K]
-
+        
         # Compute SVD-based similarity on those K
         query_svd = svd.transform(query_tfidf)
         query_norm = normalize(query_svd)[0]
         candidates = document_vectors_normalized[top_idxs]
         svd_scores = candidates.dot(query_norm)
-
+        
         # Combine lexical + latent
         alpha = 0.8
         combined = alpha * tfidf_scores[top_idxs] + (1 - alpha) * svd_scores
-
+        
         # Boost by salary (using median salary as proxy for job attractiveness)
         boost_factor = 0.2
         boosted = []
         for idx_pos, job_idx in enumerate(top_idxs):
             base_score = combined[idx_pos]
-            salary_min = data[job_idx].get("salary_min", 0)
-            salary_max = data[job_idx].get("salary_max", 0)
+            salary_min = data[job_idx].get("salary_min", 0) or 0
+            salary_max = data[job_idx].get("salary_max", 0) or 0
             median_salary = (salary_min + salary_max) / 2 if salary_max > 0 else salary_min
             boost = modified_sigmoid(median_salary / 1000)  # Normalize salary
             final_score = base_score * (1 + boost_factor * min(0, (boost - 0.5)) * 2)
             boosted.append((job_idx, final_score))
-
+        
         # Pick top N results
         N = 7
         best = sorted(boosted, key=lambda x: x[1], reverse=True)[:N]
-
+        
         # Build result list
         results = []
         for idx, score in best:
             job = data[idx].copy()
             job["score"] = float(score)
             results.append(job)
-
+        
         print(f"Search returned {len(results)} results")
     except Exception as e:
         print(f"Error during search: {e}")
         results = []
-
+    
     return jsonify(convert_to_serializable(results))
 
 @app.route("/map_data")
@@ -313,8 +314,8 @@ def map_data():
                 for similar_job in similar_jobs:
                     similar_id = similar_job.get("original_id")
                     if similar_id is not None and similar_id >= 0 and similar_id < len(data):
-                        similar_job["salary_min"] = data[similar_id].get("salary_min", 0)
-                        similar_job["salary_max"] = data[similar_id].get("salary_max", 0)
+                        similar_job["salary_min"] = data[similar_id].get("salary_min", 0) or 0
+                        similar_job["salary_max"] = data[similar_id].get("salary_max", 0) or 0
                 
                 related_jobs = similar_jobs
             
@@ -325,8 +326,8 @@ def map_data():
                     "original_id": exact_match_idx,
                     "title": center_job.get("title", "Unknown"),
                     "description": center_job.get("description", ""),
-                    "salary_min": center_job.get("salary_min", 0),
-                    "salary_max": center_job.get("salary_max", 0),
+                    "salary_min": center_job.get("salary_min", 0) or 0,
+                    "salary_max": center_job.get("salary_max", 0) or 0,
                     "experience_level": center_job.get("experience_level", "Not specified"),
                     "skills": center_job.get("skills", []),
                     "score": 1.0,
@@ -369,8 +370,8 @@ def map_data():
             for similar_job in similar_jobs:
                 similar_id = similar_job.get("original_id")
                 if similar_id is not None and similar_id >= 0 and similar_id < len(data):
-                    similar_job["salary_min"] = data[similar_id].get("salary_min", 0)
-                    similar_job["salary_max"] = data[similar_id].get("salary_max", 0)
+                    similar_job["salary_min"] = data[similar_id].get("salary_min", 0) or 0
+                    similar_job["salary_max"] = data[similar_id].get("salary_max", 0) or 0
             
             related_jobs = similar_jobs
         else:
@@ -381,8 +382,8 @@ def map_data():
                     "original_id": -1,
                     "title": job.get("title", "Unknown"),
                     "description": job.get("description", ""),
-                    "salary_min": job.get("salary_min", 0),
-                    "salary_max": job.get("salary_max", 0),
+                    "salary_min": job.get("salary_min", 0) or 0,
+                    "salary_max": job.get("salary_max", 0) or 0,
                     "experience_level": job.get("experience_level", "Not specified"),
                     "score": max(0.3, 1.0 - (i * 0.05)),
                 })
@@ -394,8 +395,8 @@ def map_data():
                 "original_id": center_index,
                 "title": center_job.get("title", "Unknown"),
                 "description": center_job.get("description", ""),
-                "salary_min": center_job.get("salary_min", 0),
-                "salary_max": center_job.get("salary_max", 0),
+                "salary_min": center_job.get("salary_min", 0) or 0,
+                "salary_max": center_job.get("salary_max", 0) or 0,
                 "experience_level": center_job.get("experience_level", "Not specified"),
                 "skills": center_job.get("skills", []),
                 "score": 1.0,
@@ -438,8 +439,8 @@ def job_as_query():
                 
                 if original_id is not None and original_id >= 0 and original_id < len(data):
                     # Add missing data from original job
-                    similar_job["salary_min"] = data[original_id].get("salary_min", 0)
-                    similar_job["salary_max"] = data[original_id].get("salary_max", 0)
+                    similar_job["salary_min"] = data[original_id].get("salary_min", 0) or 0
+                    similar_job["salary_max"] = data[original_id].get("salary_max", 0) or 0
                     similar_job["skills"] = data[original_id].get("skills", [])
                 
                 related_jobs.append({
@@ -447,8 +448,8 @@ def job_as_query():
                     "original_id": original_id,
                     "title": similar_job.get("title"),
                     "description": similar_job.get("description"),
-                    "salary_min": similar_job.get("salary_min", 0),
-                    "salary_max": similar_job.get("salary_max", 0),
+                    "salary_min": similar_job.get("salary_min", 0) or 0,
+                    "salary_max": similar_job.get("salary_max", 0) or 0,
                     "experience_level": similar_job.get("experience_level", "Not specified"),
                     "score": similar_job.get("score"),
                 })
@@ -460,8 +461,8 @@ def job_as_query():
                 "original_id": job_id,
                 "title": center_job.get("title", "Unknown"),
                 "description": center_job.get("description", ""),
-                "salary_min": center_job.get("salary_min", 0),
-                "salary_max": center_job.get("salary_max", 0),
+                "salary_min": center_job.get("salary_min", 0) or 0,
+                "salary_max": center_job.get("salary_max", 0) or 0,
                 "experience_level": center_job.get("experience_level", "Not specified"),
                 "skills": center_job.get("skills", []),
                 "score": 1.0,
@@ -527,8 +528,8 @@ def reinforce():
                 "original_id": sid,
                 "title": job_data.get("title", "Unknown"),
                 "description": job_data.get("description", ""),
-                "salary_min": job_data.get("salary_min", 0),
-                "salary_max": job_data.get("salary_max", 0),
+                "salary_min": job_data.get("salary_min", 0) or 0,
+                "salary_max": job_data.get("salary_max", 0) or 0,
                 "experience_level": job_data.get("experience_level", "Not specified"),
                 "score": 0.95,
             })
@@ -547,8 +548,8 @@ def reinforce():
                     "original_id": original_id,
                     "title": job_data.get("title", job.get("title", "Unknown")),
                     "description": job_data.get("description", job.get("description", "")),
-                    "salary_min": job_data.get("salary_min", 0),
-                    "salary_max": job_data.get("salary_max", 0),
+                    "salary_min": job_data.get("salary_min", 0) or 0,
+                    "salary_max": job_data.get("salary_max", 0) or 0,
                     "experience_level": job_data.get("experience_level", "Not specified"),
                     "score": score,
                 })
@@ -564,8 +565,8 @@ def reinforce():
                     "original_id": random_id,
                     "title": job_data.get("title", "Unknown"),
                     "description": job_data.get("description", ""),
-                    "salary_min": job_data.get("salary_min", 0),
-                    "salary_max": job_data.get("salary_max", 0),
+                    "salary_min": job_data.get("salary_min", 0) or 0,
+                    "salary_max": job_data.get("salary_max", 0) or 0,
                     "experience_level": job_data.get("experience_level", "Not specified"),
                     "score": 0.5,
                 })
@@ -579,8 +580,8 @@ def reinforce():
                 "original_id": center_id,
                 "title": center_job.get("title", "Unknown"),
                 "description": center_job.get("description", ""),
-                "salary_min": center_job.get("salary_min", 0),
-                "salary_max": center_job.get("salary_max", 0),
+                "salary_min": center_job.get("salary_min", 0) or 0,
+                "salary_max": center_job.get("salary_max", 0) or 0,
                 "experience_level": center_job.get("experience_level", "Not specified"),
                 "skills": center_job.get("skills", []),
                 "score": 1.0,
